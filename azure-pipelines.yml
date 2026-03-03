@@ -1,0 +1,298 @@
+trigger: none  
+pr: none
+
+variables:
+- group: RCSI_QA
+- name: agentName
+  value: 'RCSI-QA'
+- name: CustomerPackagesXmlReferencePath
+  value: 'C:\Build\CustomerPackages\CustomerPackages\Canada\Montreal'
+- name: CustomerPackagesUploadScriptPath
+  value: 'C:\Build\CustomerPackages\CustomerPackages\Canada\Montreal\Run-UploadPackages.ps1'
+- name: webAppPool
+  value: 'TitaniumSolutionsDentalAppPool'
+- name: BackupDirectory
+  value: 'G:\DB'
+
+
+resources:
+  pipelines:
+    - pipeline: SaludServicesTrunk  # Alias for the referenced pipeline
+      project: Titanium                     # The project where the pipeline exists
+      source: "Salud Services Trunk"        # The actual pipeline name (quoted because it contains spaces)
+      trigger:
+        tags:
+        - ReleaseReady # Trigger only on tags named 'ReleaseReady'
+
+stages:
+  - stage: Deploy_Approval
+    displayName: Deploy Approval
+    jobs:
+    - deployment: Deploy
+      displayName: RCSI deployment
+      environment: 'RCSI'   # <-- triggers Approvals & checks
+      pool:
+        name: Dublin
+        demands: 'agent.name -equals RCSI-QA'
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - checkout: self
+            - script: |
+                echo "Dumping entire repo content:"
+                dir /s "$(Build.SourcesDirectory)"
+              displayName: "Debug — List All Files"
+            # Stop IIS Services
+            - task: PowerShell@2
+              displayName: "Stop IIS Services"
+              inputs:
+                filePath: "$(Build.SourcesDirectory)/scripts/Stop-IIS.ps1"
+                failOnStderr: true
+            - task: PowerShell@2
+              displayName: "Copy Maintenance Scripts"
+              inputs:
+                targetType: inline
+                script: |
+                  $src  = "$(Build.SourcesDirectory)\scripts"
+                  $dest = "C:\MaintenancePage\MaintenancePage"
+
+                  Write-Host "Ensuring destination directory exists at $dest..."
+                  if (-not (Test-Path $dest)) {
+                      New-Item -ItemType Directory -Path $dest -Force | Out-Null
+                  }
+
+                  Write-Host "Listing files in source directory: $src"
+                  Get-ChildItem -Recurse $src | ForEach-Object {
+                      Write-Host " - $($_.FullName)"
+                  }
+
+                  Write-Host "Copying maintenance scripts to $dest..."
+                  Copy-Item "$src\Server.ps1" $dest -Force
+                  Copy-Item "$src\maintenance.html" $dest -Force
+            # Display Banner
+            # Start maintenance listener
+            - task: PowerShell@2
+              displayName: "Ensure Maintenance Task Exists"
+              inputs:
+                targetType: inline
+                script: |
+                  $taskName = "MaintenanceServer"
+                  $scriptPath = "C:\MaintenancePage\MaintenancePage\Server.ps1"
+
+                  $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
+                  $trigger = New-ScheduledTaskTrigger -Once -At "00:00"   # dummy trigger, not actually used
+                  $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+
+                  Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force
+            #Start maintenance task
+            - task: PowerShell@2
+              displayName: "Maintenance ON"
+              inputs:
+                targetType: inline
+                script: |
+                  schtasks /run /tn "MaintenanceServer"
+  - stage: FetchSaludArtifacts
+    displayName: "Download Stage"
+    dependsOn: BackupDatabase
+    condition: succeeded()  # Ensure this stage runs only if the previous stage succeeded
+    jobs:
+      - job: DownloadArtifacts
+        pool:
+          name: Dublin
+          demands: 'agent.name -equals $(agentName)'
+        workspace:
+          clean: all
+        steps:
+          # Download artifacts from the SaludServices104.120Pipeline
+          - download: SaludServicesTrunk
+            artifact: drop
+            patterns: |
+              drop/CustomerPackages.zip
+              drop/Setup_Origin.msi
+            displayName: "Downloading Artifacts"
+          # Copy the downloaded artifacts to the build directory
+          - task: PowerShell@2
+            displayName: "Copying Artifacts to Build Directory"
+            inputs:
+              filePath: "$(Build.SourcesDirectory)/scripts/Copy-Artifacts.ps1"
+              arguments: >
+                -sourcePath "$(Pipeline.Workspace)\SaludServicesTrunk\drop\" 
+                -destinationPath "C:\Build\" 
+                -itemsToMove "Setup_Origin.msi,CustomerPackages.zip"
+              failOnStderr: true
+            # Extract the CustomerPackages.zip file
+          - powershell: |
+              $zipPath = "C:\Build\CustomerPackages.zip"
+              $extractPath = "C:\Build\CustomerPackages"
+              Write-Host "ZIP Path: $zipPath"
+              Write-Host "Extract Path: $extractPath"
+              Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+            displayName: "Extracting CustomerPackages.zip"
+  - stage: InstallApplication
+    displayName: "Install Application Stage"
+    dependsOn:
+      - FetchSaludArtifacts
+    condition: succeeded()  # Ensure this stage runs only if the previous stage succeeded
+    jobs:
+      - job: InstallAppJob
+        pool:
+          name: Dublin
+          demands: 'agent.name -equals $(agentName)'
+        steps:
+          # Clear the registry values
+          - task: PowerShell@2
+            displayName: "Clear Registry Values"
+            inputs:
+              filePath: "$(Build.SourcesDirectory)/scripts/Clear-Registry.ps1"
+              arguments: >
+                -registryPath "HKLM:\SOFTWARE\Titanium\Salud\Install" 
+                -registryPathReg "HKEY_LOCAL_MACHINE\SOFTWARE\Titanium\Salud\Install" 
+                -backupDirectory "C:\registry_backup"
+              failOnStderr: true
+          # Install the Salud application
+          - task: PowerShell@2
+            displayName: "Install Origin Application"
+            inputs:
+              filePath: "$(Build.SourcesDirectory)/scripts/Install-Origin.ps1"
+              arguments: >
+                -buildDirectory "C:\Build\" 
+                -installerFile "Setup_Origin.msi" 
+                -logFile "msiexec.log" 
+                -installDir "C:\Program Files\Titanium Solutions" 
+                -features "SelfCheckInFeature,WebServicesFeature,ImagingServicesFeature,ConfigureIISFeature,APIServicesFeature,RenderServicesFeature" 
+                -webSite "Default Web Site" 
+                -webDescription "Default Web Site" 
+                -webSPort 80 
+                -webSiteIp "*" 
+                -dsnMssqlDatabase $ENV:DB_NAME 
+                -dsnMssqlPassword $ENV:SQL_PASSWORD 
+                -dsnMssqlServer $ENV:DB_IP 
+                -dsnMssqlUsername $ENV:SQL_USER 
+                -webServicesPathName "TITANIUMWSERVER" 
+                -webApplicationsPathName "TITANIUMCLIENT" 
+                -allowMultipleVersions "No" 
+                -webAppName "Origin" 
+                -webAppPool "$(webAppPool)"
+                -webAppPoolCreate "true" 
+                -documentsPath "%ALLUSERSPROFILE%\Titanium Solutions\Documents" 
+                -reportingServicesURL "" 
+                -reportingServicesContextFolder ""
+                -reportingServicesMenuFolder "" 
+                -reportingServicesUserName "" 
+                -reportingServicesPassword ""  
+            env:
+              DB_IP: $(privateDB)
+              DB_NAME: $(databaseName)
+              SQL_USER: $(databaseUser)
+              SQL_PASSWORD: $(databasePassword)
+              failOnStderr: true
+          # Configure IIS Application
+          - task: PowerShell@2
+            displayName: "Configure IIS Services"
+            inputs:
+              filePath: "$(Build.SourcesDirectory)/scripts/Configure-IIS.ps1"
+            continueOnError: true
+  - stage: DatabaseMigration
+    displayName: "Database Migration Stage"
+    dependsOn: 
+      - InstallApplication
+    condition: succeeded() 
+    jobs:
+      - job: MigrateDatabaseJob
+        pool:
+          name: Dublin
+          demands: 'agent.name -equals $(agentName)'
+
+        steps:
+
+          # Run the database migration
+          - task: PowerShell@2
+            displayName: "Run Data Migration"
+            inputs:
+              filePath: "$(Build.SourcesDirectory)/scripts/Run-DatabaseMigration.ps1"
+              arguments: >
+                -exePath "C:\Program Files\Titanium Solutions\Dental Web Services\bin\Titanium.Migration.DataAccess.Migration.exe" 
+                -server $ENV:DB_IP 
+                -database $ENV:DB_NAME 
+                -user $ENV:SQL_USER 
+                -password $ENV:SQL_PASSWORD 
+                -logFile "C:\Build\DataMigrationLog.txt"
+              failOnStderr: true
+            env:
+              DB_NAME: $(databaseName)
+              SQL_USER: $(databaseUser)
+              SQL_PASSWORD: $(databasePassword)
+              DB_IP: $(privateDB)
+              failOnStderr: true
+
+          # Display Migration Log Message
+          - task: PowerShell@2
+            displayName: "Display Migration Log Message"
+            condition: eq(variables['Agent.JobStatus'], 'SucceededWithIssues')
+            continueOnError: true
+            inputs:
+              filePath: "$(Build.SourcesDirectory)/scripts/Migration-Message.ps1"
+  - stage: UploadCustomerPackages
+    displayName: "Upload Customer Packages Stage"
+    dependsOn:
+      - DatabaseMigration
+    condition: succeeded() # Ensure this stage runs only if the previous stage succeeded
+    jobs:
+      - job: UploadPackagesJob
+        pool:
+          name: Dublin
+          demands: 'agent.name -equals $(agentName)'
+        steps:
+
+          # Start the IIS service
+          - task: PowerShell@2
+            displayName: "Start IIS Services"
+            inputs:
+              filePath: "$(Build.SourcesDirectory)/scripts/Start-IIS.ps1"
+              failOnStderr: true
+          
+          # Stop Display Banner - stops task, kill process
+          - task: PowerShell@2
+            displayName: "Maintenance OFF"
+            inputs:
+              targetType: inline
+              script: |
+                schtasks /end /tn "MaintenanceServer" 2>$null
+
+                # OPTIONAL: kill any remaining server processes
+                Get-Process powershell -ErrorAction SilentlyContinue | 
+                  Where-Object { $_.StartInfo.Arguments -like "*Server.ps1*" } |
+                  Stop-Process -Force -ErrorAction SilentlyContinue
+
+          # Configure Customer Packages for Upload
+          - task: PowerShell@2
+            displayName: "Configure CustomerPackages"
+            inputs:
+              filePath: "$(Build.SourcesDirectory)/scripts/Create-UploadWebServices.ps1"
+              arguments: >
+                -url $env:API_URL 
+                -username $env:ADMIN_USERNAME 
+                -password $env:ADMIN_PASSWORD
+                -clinic $env:CLINIC
+                -filepath "$(CustomerPackagesXmlReferencePath)"
+            env:
+              ADMIN_USERNAME: $(admin_username)
+              ADMIN_PASSWORD: $(admin_password)
+              CLINIC: $(clinic_key)
+              API_URL: $(API)
+
+          # Copy upload customer packages wrapper script to the build directory
+          - task: CopyFiles@2
+            inputs:
+              SourceFolder: '$(Build.SourcesDirectory)/scripts'
+              Contents: 'Run-UploadPackages.ps1'
+              TargetFolder: '$(CustomerPackagesXmlReferencePath)'
+              failOnStderr: true
+
+          # Install the CustomerPackages
+          - task: PowerShell@2
+            displayName: "Install CustomerPackages"
+            inputs:
+              filePath: "$(CustomerPackagesUploadScriptPath)"
+            continueOnError: true
