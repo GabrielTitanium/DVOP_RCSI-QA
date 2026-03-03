@@ -94,7 +94,7 @@ stages:
                   schtasks /run /tn "MaintenanceServer"
   - stage: FetchSaludArtifacts
     displayName: "Download Stage"
-    dependsOn: BackupDatabase
+    dependsOn: Deploy_Approval
     condition: succeeded()  # Ensure this stage runs only if the previous stage succeeded
     jobs:
       - job: DownloadArtifacts
