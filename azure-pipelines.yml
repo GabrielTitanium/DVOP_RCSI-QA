@@ -30,7 +30,7 @@ stages:
     jobs:
     - deployment: Deploy
       displayName: RCSI deployment
-      environment: 'RCSI'   # <-- triggers Approvals & checks
+      environment: 'RCSI-QA'   # <-- triggers Approvals & checks
       pool:
         name: Dublin
         demands: 'agent.name -equals RCSI-QA'
