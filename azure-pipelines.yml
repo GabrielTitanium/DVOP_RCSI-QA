@@ -6,9 +6,9 @@ variables:
 - name: agentName
   value: 'RCSI-QA'
 - name: CustomerPackagesXmlReferencePath
-  value: 'C:\Build\CustomerPackages\CustomerPackages\Canada\Montreal'
+  value: 'C:\Build\CustomerPackages\CustomerPackages\Europe\Cork'
 - name: CustomerPackagesUploadScriptPath
-  value: 'C:\Build\CustomerPackages\CustomerPackages\Canada\Montreal\Run-UploadPackages.ps1'
+  value: 'C:\Build\CustomerPackages\CustomerPackages\Europe\Cork\Run-UploadPackages.ps1'
 - name: webAppPool
   value: 'TitaniumSolutionsDentalAppPool'
 - name: BackupDirectory
